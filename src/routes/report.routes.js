@@ -12,55 +12,78 @@ import { refreshOverdueTasks } from '../utils/sla.js';
 const router = express.Router();
 router.use(protect);
 
-async function buildDashboard(user) {
-  await refreshOverdueTasks(await taskQueryForUser(user));
+const taskPendingStatuses = ['todo', 'inProgress', 'review'];
+const ticketPendingStatuses = ['open', 'inProgress', 'waiting', 'escalated'];
+const taskClosedStatuses = ['completed', 'cancelled', 'rejected'];
+const ticketClosedStatuses = ['resolved', 'closed', 'rejected'];
+
+function isTicketReport(req) {
+  return String(req.query.type || req.query.reportType || 'task').toLowerCase() === 'ticket';
+}
+
+async function buildBaseQueries(user) {
   const ids = await accessibleUserIds(user);
   const taskQuery = await taskQueryForUser(user);
   const userQuery = ['admin', 'auditor'].includes(user.role) ? {} : { _id: { $in: ids } };
-  const ticketQuery = ['admin', 'auditor'].includes(user.role) ? {} : { $or: [{ assignedTo: { $in: ids } }, { createdBy: user._id }, { department: user.department }] };
+  const ticketQuery = ['admin', 'auditor'].includes(user.role)
+    ? {}
+    : { $or: [{ assignedTo: { $in: ids } }, { createdBy: user._id }, { department: user.department }] };
+  return { ids, taskQuery, ticketQuery, userQuery };
+}
+
+function commonDates() {
+  const todayStart = new Date(); todayStart.setHours(0, 0, 0, 0);
+  const todayEnd = new Date(); todayEnd.setHours(23, 59, 59, 999);
+  const weekStart = new Date(Date.now() - 6 * 24 * 60 * 60 * 1000); weekStart.setHours(0, 0, 0, 0);
+  return { todayStart, todayEnd, weekStart, now: new Date() };
+}
+
+async function buildTaskDashboard(user) {
+  const { taskQuery, ticketQuery, userQuery } = await buildBaseQueries(user);
+  await refreshOverdueTasks(taskQuery);
+
   const [users, tasks, tickets, departments] = await Promise.all([
     User.find(userQuery).select('_id name role department status workStatus').lean(),
     Task.find(taskQuery)
-      .select('_id title project status priority dueDate completedAt assignedTo department')
+      .select('_id title project status priority dueDate completedAt assignedTo department createdAt')
       .populate('assignedTo', 'name role department workStatus')
       .lean(),
     Ticket.find(ticketQuery).select('_id status').lean(),
     Department.countDocuments({ isActive: true })
   ]);
-  const todayStart = new Date(); todayStart.setHours(0,0,0,0);
-  const todayEnd = new Date(); todayEnd.setHours(23,59,59,999);
-  const weekStart = new Date(Date.now() - 6 * 24 * 60 * 60 * 1000); weekStart.setHours(0,0,0,0);
 
-  const count = (fn) => tasks.filter(fn).length;
+  const { todayStart, todayEnd, weekStart, now } = commonDates();
+  const count = fn => tasks.filter(fn).length;
+
   const widgets = {
     totalEmployees: users.length,
     activeEmployees: users.filter(u => u.status === 'active').length,
     inactiveEmployees: users.filter(u => u.status === 'inactive').length,
     totalDepartments: departments,
-    totalProjects: new Set(tasks.map(t => t.project)).size,
+    totalProjects: new Set(tasks.map(t => t.project).filter(Boolean)).size,
     totalTasks: tasks.length,
-    openTasks: count(t => !['completed', 'cancelled', 'rejected'].includes(t.status)),
+    openTasks: count(t => !taskClosedStatuses.includes(t.status)),
     completedTasks: count(t => t.status === 'completed'),
-    pendingTasks: count(t => ['todo', 'inProgress', 'review'].includes(t.status)),
-    overdueTasks: count(t => t.status === 'overdue' || (t.dueDate < new Date() && !['completed', 'cancelled'].includes(t.status))),
+    pendingTasks: count(t => taskPendingStatuses.includes(t.status)),
+    overdueTasks: count(t => t.status === 'overdue' || (t.dueDate && t.dueDate < now && !['completed', 'cancelled'].includes(t.status))),
     urgentTasks: count(t => t.priority === 'urgent'),
     todayTasks: count(t => t.dueDate >= todayStart && t.dueDate <= todayEnd),
     weekTasks: count(t => t.dueDate >= weekStart),
-    openTickets: tickets.filter(t => !['closed','resolved'].includes(t.status)).length
+    openTickets: tickets.filter(t => !['closed', 'resolved', 'rejected'].includes(t.status)).length
   };
 
-  const statusChart = ['todo','inProgress','review','completed','overdue','rejected'].map(status => ({ label: status, value: tasks.filter(t => t.status === status).length }));
-  const priorityChart = ['low','medium','high','urgent'].map(priority => ({ label: priority, value: tasks.filter(t => t.priority === priority).length }));
+  const statusChart = ['todo', 'inProgress', 'review', 'completed', 'overdue', 'rejected'].map(status => ({ label: status, value: tasks.filter(t => t.status === status).length }));
+  const priorityChart = ['low', 'medium', 'high', 'urgent'].map(priority => ({ label: priority, value: tasks.filter(t => t.priority === priority).length }));
 
   const employeePerformance = users.map(u => {
     const empTasks = tasks.filter(t => String(t.assignedTo?._id || t.assignedTo) === String(u._id));
     const completed = empTasks.filter(t => t.status === 'completed').length;
-    const delayed = empTasks.filter(t => t.status === 'overdue' || (t.completedAt && t.completedAt > t.dueDate)).length;
-    const pending = empTasks.filter(t => ['todo','inProgress','review'].includes(t.status)).length;
+    const delayed = empTasks.filter(t => t.status === 'overdue' || (t.completedAt && t.dueDate && t.completedAt > t.dueDate)).length;
+    const pending = empTasks.filter(t => taskPendingStatuses.includes(t.status)).length;
     const score = empTasks.length ? Math.max(0, Math.round((completed / empTasks.length) * 100 - delayed * 5)) : 0;
-    const workload = empTasks.filter(t => !['completed','cancelled'].includes(t.status)).length;
+    const workload = empTasks.filter(t => !['completed', 'cancelled'].includes(t.status)).length;
     return { _id: u._id, name: u.name, role: u.role, department: u.department, workStatus: u.workStatus, total: empTasks.length, completed, pending, delayed, workload, productivityScore: score };
-  });
+  }).sort((a, b) => b.total - a.total || a.name.localeCompare(b.name));
 
   const departmentsList = [...new Set(users.map(u => u.department).filter(Boolean))];
   const departmentPerformance = departmentsList.map(dep => {
@@ -69,30 +92,104 @@ async function buildDashboard(user) {
       department: dep,
       total: depTasks.length,
       completed: depTasks.filter(t => t.status === 'completed').length,
-      pending: depTasks.filter(t => ['todo','inProgress','review'].includes(t.status)).length,
-      overdue: depTasks.filter(t => t.status === 'overdue').length
+      pending: depTasks.filter(t => taskPendingStatuses.includes(t.status)).length,
+      overdue: depTasks.filter(t => t.status === 'overdue' || (t.dueDate && t.dueDate < now && !['completed', 'cancelled'].includes(t.status))).length
     };
   });
 
   const overdueTrend = Array.from({ length: 7 }).map((_, i) => {
     const d = new Date(Date.now() - (6 - i) * 24 * 60 * 60 * 1000);
-    const start = new Date(d); start.setHours(0,0,0,0);
-    const end = new Date(d); end.setHours(23,59,59,999);
-    return { date: start.toISOString().slice(0,10), overdue: tasks.filter(t => t.dueDate >= start && t.dueDate <= end && (t.status === 'overdue' || (t.dueDate < new Date() && t.status !== 'completed'))).length };
+    const start = new Date(d); start.setHours(0, 0, 0, 0);
+    const end = new Date(d); end.setHours(23, 59, 59, 999);
+    return { date: start.toISOString().slice(0, 10), overdue: tasks.filter(t => t.dueDate >= start && t.dueDate <= end && (t.status === 'overdue' || (t.dueDate < now && t.status !== 'completed'))).length };
   });
 
-  return { role: user.role, user: { _id: user._id, name: user.name, role: user.role, department: user.department }, widgets, statusChart, priorityChart, employeePerformance, departmentPerformance, overdueTrend, tickets: { total: tickets.length, open: widgets.openTickets } };
+  return { reportType: 'task', role: user.role, user: { _id: user._id, name: user.name, role: user.role, department: user.department }, widgets, statusChart, priorityChart, employeePerformance, departmentPerformance, overdueTrend, tickets: { total: tickets.length, open: widgets.openTickets } };
+}
+
+async function buildTicketDashboard(user) {
+  const { ticketQuery, userQuery } = await buildBaseQueries(user);
+  const [users, tickets, departments] = await Promise.all([
+    User.find(userQuery).select('_id name role department status workStatus').lean(),
+    Ticket.find(ticketQuery)
+      .select('_id ticketNo title status priority slaDueDate resolvedAt closedAt assignedTo department createdAt')
+      .populate('assignedTo', 'name role department workStatus')
+      .lean(),
+    Department.countDocuments({ isActive: true })
+  ]);
+
+  const { todayStart, todayEnd, weekStart, now } = commonDates();
+  const count = fn => tickets.filter(fn).length;
+
+  const widgets = {
+    totalEmployees: users.length,
+    activeEmployees: users.filter(u => u.status === 'active').length,
+    inactiveEmployees: users.filter(u => u.status === 'inactive').length,
+    totalDepartments: departments,
+    totalTickets: tickets.length,
+    totalTasks: tickets.length,
+    openTickets: count(t => !ticketClosedStatuses.includes(t.status)),
+    completedTickets: count(t => ['resolved', 'closed'].includes(t.status)),
+    completedTasks: count(t => ['resolved', 'closed'].includes(t.status)),
+    pendingTickets: count(t => ticketPendingStatuses.includes(t.status)),
+    pendingTasks: count(t => ticketPendingStatuses.includes(t.status)),
+    overdueTickets: count(t => t.slaDueDate && t.slaDueDate < now && !ticketClosedStatuses.includes(t.status)),
+    overdueTasks: count(t => t.slaDueDate && t.slaDueDate < now && !ticketClosedStatuses.includes(t.status)),
+    urgentTickets: count(t => t.priority === 'urgent'),
+    urgentTasks: count(t => t.priority === 'urgent'),
+    todayTickets: count(t => t.slaDueDate >= todayStart && t.slaDueDate <= todayEnd),
+    todayTasks: count(t => t.slaDueDate >= todayStart && t.slaDueDate <= todayEnd),
+    weekTickets: count(t => t.slaDueDate >= weekStart)
+  };
+
+  const statusChart = ['open', 'inProgress', 'waiting', 'resolved', 'closed', 'escalated', 'rejected'].map(status => ({ label: status, value: tickets.filter(t => t.status === status).length }));
+  const priorityChart = ['low', 'medium', 'high', 'urgent'].map(priority => ({ label: priority, value: tickets.filter(t => t.priority === priority).length }));
+
+  const employeePerformance = users.map(u => {
+    const empTickets = tickets.filter(t => String(t.assignedTo?._id || t.assignedTo) === String(u._id));
+    const completed = empTickets.filter(t => ['resolved', 'closed'].includes(t.status)).length;
+    const delayed = empTickets.filter(t => (t.slaDueDate && t.slaDueDate < now && !ticketClosedStatuses.includes(t.status)) || (t.resolvedAt && t.slaDueDate && t.resolvedAt > t.slaDueDate)).length;
+    const pending = empTickets.filter(t => ticketPendingStatuses.includes(t.status)).length;
+    const score = empTickets.length ? Math.max(0, Math.round((completed / empTickets.length) * 100 - delayed * 5)) : 0;
+    const workload = empTickets.filter(t => !ticketClosedStatuses.includes(t.status)).length;
+    return { _id: u._id, name: u.name, role: u.role, department: u.department, workStatus: u.workStatus, total: empTickets.length, completed, pending, delayed, workload, productivityScore: score };
+  }).sort((a, b) => b.total - a.total || a.name.localeCompare(b.name));
+
+  const departmentsList = [...new Set(users.map(u => u.department).filter(Boolean))];
+  const departmentPerformance = departmentsList.map(dep => {
+    const depTickets = tickets.filter(t => t.department === dep || t.assignedTo?.department === dep);
+    return {
+      department: dep,
+      total: depTickets.length,
+      completed: depTickets.filter(t => ['resolved', 'closed'].includes(t.status)).length,
+      pending: depTickets.filter(t => ticketPendingStatuses.includes(t.status)).length,
+      overdue: depTickets.filter(t => t.slaDueDate && t.slaDueDate < now && !ticketClosedStatuses.includes(t.status)).length
+    };
+  });
+
+  const overdueTrend = Array.from({ length: 7 }).map((_, i) => {
+    const d = new Date(Date.now() - (6 - i) * 24 * 60 * 60 * 1000);
+    const start = new Date(d); start.setHours(0, 0, 0, 0);
+    const end = new Date(d); end.setHours(23, 59, 59, 999);
+    return { date: start.toISOString().slice(0, 10), overdue: tickets.filter(t => t.slaDueDate >= start && t.slaDueDate <= end && t.slaDueDate < now && !ticketClosedStatuses.includes(t.status)).length };
+  });
+
+  return { reportType: 'ticket', role: user.role, user: { _id: user._id, name: user.name, role: user.role, department: user.department }, widgets, statusChart, priorityChart, employeePerformance, departmentPerformance, overdueTrend, tickets: { total: tickets.length, open: widgets.openTickets } };
+}
+
+async function buildDashboard(user, type = 'task') {
+  return type === 'ticket' ? buildTicketDashboard(user) : buildTaskDashboard(user);
 }
 
 router.get('/dashboard', async (req, res) => {
-  res.json(await buildDashboard(req.user));
+  res.json(await buildDashboard(req.user, isTicketReport(req) ? 'ticket' : 'task'));
 });
 
 router.get('/tasks', async (req, res) => {
   const q = await taskQueryForUser(req.user);
   if (req.query.period === 'daily') {
-    const start = new Date(); start.setHours(0,0,0,0);
-    const end = new Date(); end.setHours(23,59,59,999);
+    const start = new Date(); start.setHours(0, 0, 0, 0);
+    const end = new Date(); end.setHours(23, 59, 59, 999);
     q.createdAt = { $gte: start, $lte: end };
   }
   if (req.query.period === 'weekly') q.createdAt = { $gte: new Date(Date.now() - 7 * 24 * 60 * 60 * 1000) };
@@ -102,32 +199,35 @@ router.get('/tasks', async (req, res) => {
 });
 
 router.get('/export', async (req, res) => {
-  const data = await buildDashboard(req.user);
-  const rows = data.employeePerformance.map(r => ({ Employee: r.name, Role: r.role, Department: r.department, Total: r.total, Completed: r.completed, Pending: r.pending, Delayed: r.delayed, Workload: r.workload, Score: r.productivityScore }));
+  const type = isTicketReport(req) ? 'ticket' : 'task';
+  const data = await buildDashboard(req.user, type);
+  const label = type === 'ticket' ? 'Ticket' : 'Task';
+  const rows = data.employeePerformance.map(r => ({ Employee: r.name, Role: r.role, Department: r.department, [`Total ${label}s`]: r.total, Completed: r.completed, Pending: r.pending, Delayed: r.delayed, Workload: r.workload, Score: r.productivityScore }));
   const format = req.query.format || 'xlsx';
   if (format === 'csv') {
-    const csv = [Object.keys(rows[0] || {}).join(','), ...rows.map(r => Object.values(r).join(','))].join('\n');
+    const headers = Object.keys(rows[0] || { Employee: '', Role: '', Department: '', [`Total ${label}s`]: '', Completed: '', Pending: '', Delayed: '', Workload: '', Score: '' });
+    const csv = [headers.join(','), ...rows.map(r => headers.map(h => JSON.stringify(r[h] ?? '')).join(','))].join('\n');
     res.setHeader('Content-Type', 'text/csv');
-    res.setHeader('Content-Disposition', 'attachment; filename=takora-task-report.csv');
+    res.setHeader('Content-Disposition', `attachment; filename=takora-${type}-report.csv`);
     return res.send(csv);
   }
   if (format === 'pdf') {
     res.setHeader('Content-Type', 'application/pdf');
-    res.setHeader('Content-Disposition', 'attachment; filename=takora-task-report.pdf');
+    res.setHeader('Content-Disposition', `attachment; filename=takora-${type}-report.pdf`);
     const doc = new PDFDocument({ margin: 40 });
     doc.pipe(res);
-    doc.fontSize(18).text('Takora Mart Task Management Report', { align: 'center' });
+    doc.fontSize(18).text(`Takora Mart ${label} Management Report`, { align: 'center' });
     doc.moveDown();
-    rows.forEach(r => doc.fontSize(10).text(`${r.Employee} | ${r.Department} | Total ${r.Total} | Completed ${r.Completed} | Pending ${r.Pending} | Delayed ${r.Delayed} | Score ${r.Score}`));
+    rows.forEach(r => doc.fontSize(10).text(`${r.Employee} | ${r.Department} | Total ${r[`Total ${label}s`]} | Completed ${r.Completed} | Pending ${r.Pending} | Delayed ${r.Delayed} | Score ${r.Score}`));
     doc.end();
     return;
   }
   const wb = xlsx.utils.book_new();
   const ws = xlsx.utils.json_to_sheet(rows);
-  xlsx.utils.book_append_sheet(wb, ws, 'Employee Report');
+  xlsx.utils.book_append_sheet(wb, ws, `${label} Report`);
   const buffer = xlsx.write(wb, { type: 'buffer', bookType: 'xlsx' });
   res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
-  res.setHeader('Content-Disposition', 'attachment; filename=takora-task-report.xlsx');
+  res.setHeader('Content-Disposition', `attachment; filename=takora-${type}-report.xlsx`);
   res.send(buffer);
 });
 
