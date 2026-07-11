@@ -148,36 +148,18 @@ export async function refreshOverdueTasks(scopeQuery = {}) {
     approvalStatus: { $nin: ['adminApproved', 'managerApproved'] }
   };
 
-  const tasks = await Task.find(q).populate('assignedTo assignedBy', 'name email role reportingManager department');
-  let changed = 0;
-
-  for (const task of tasks) {
-    task.status = 'overdue';
-    task.activityLog.push({ actor: task.assignedTo?._id, action: 'SLA_OVERDUE', detail: 'Task crossed official SLA and color changed to overdue.' });
-    changed += 1;
-    await task.save();
-
-    const recipients = await managerRecipientsForTask(task, task.assignedTo?._id);
-    await notifyMany(recipients, {
-      title: 'SLA Breach Alert',
-      message: `${task.title} crossed ${visibleSlaLabel(task.priority)} SLA and is now overdue.`,
-      type: 'deadline',
-      refType: 'Task',
-      refId: task._id,
-      channels: ['dashboard', 'email']
-    });
-    if (task.assignedTo?._id) {
-      await notifyUser({
-        userId: task.assignedTo._id,
-        title: 'Task Overdue',
-        message: `${task.title} crossed official SLA. Please update or submit the task.`,
-        type: 'deadline',
-        refType: 'Task',
-        refId: task._id,
-        channels: ['dashboard', 'email', 'whatsapp', 'sms']
-      });
+  // Fast page-load update: mark overdue tasks in one MongoDB operation.
+  // This avoids slow dashboard/task/ticket page loads caused by looping every overdue task and sending emails.
+  const result = await Task.updateMany(q, {
+    $set: { status: 'overdue' },
+    $push: {
+      activityLog: {
+        action: 'SLA_OVERDUE',
+        detail: 'Task crossed official SLA and color changed to overdue.',
+        createdAt: now
+      }
     }
-  }
+  });
 
-  return changed;
+  return result.modifiedCount || 0;
 }

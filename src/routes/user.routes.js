@@ -91,7 +91,7 @@ router.get('/assignable', async (req, res, next) => {
   try {
     const users = await User.find({ status: 'active' })
       .select('_id name email role department branch designation employeeId phone whatsapp avatar avatarKey workStatus status')
-      .sort({ role: 1, department: 1, name: 1 });
+      .sort({ name: 1, role: 1, department: 1 });
 
     res.json({ users: await Promise.all(users.map(publicAssignableUser)) });
   } catch (error) {
@@ -110,7 +110,7 @@ router.get('/', async (req, res, next) => {
 
     const users = await User.find(query)
       .populate('reportingManager', 'name email role')
-      .sort({ role: 1, name: 1 });
+      .sort({ createdAt: -1, name: 1 });
 
     res.json({ users: await Promise.all(users.map(safeUser)) });
   } catch (error) {
@@ -124,8 +124,9 @@ router.get('/summary', async (req, res, next) => {
     const query = req.user.role === 'admin' || req.user.role === 'auditor' ? {} : { _id: { $in: ids } };
 
     const users = await User.find(query)
-      .select('_id name email role department status workStatus designation phone whatsapp reportingManager branch employeeId avatar avatarKey')
-      .populate('reportingManager', 'name email role');
+      .select('_id name email role department status workStatus designation phone whatsapp reportingManager branch employeeId avatar avatarKey createdAt updatedAt')
+      .populate('reportingManager', 'name email role')
+      .sort({ createdAt: -1, name: 1 });
 
     const taskAgg = await Task.aggregate([
       { $match: { assignedTo: { $in: users.map(u => u._id) } } },

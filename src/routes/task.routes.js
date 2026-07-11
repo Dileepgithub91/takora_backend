@@ -112,7 +112,7 @@ async function setTaskAssigneeAndDefaults(req, body) {
 
 router.get('/', async (req, res) => {
   const q = await buildTaskQuery(req);
-  const tasks = await populateTask(Task.find(q).sort({ status: 1, dueDate: 1, createdAt: -1 }));
+  const tasks = await populateTask(Task.find(q).sort({ createdAt: -1, updatedAt: -1 }));
   res.json({ tasks });
 });
 
@@ -121,7 +121,7 @@ router.get('/calendar', async (req, res) => {
   const tasks = await Task.find(q)
     .select('title status priority dueDate assignedTo department')
     .populate('assignedTo', 'name role department')
-    .sort({ dueDate: 1 });
+    .sort({ createdAt: -1, dueDate: 1 });
 
   res.json({
     events: tasks.map(t => ({

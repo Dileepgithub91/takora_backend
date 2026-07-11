@@ -17,11 +17,16 @@ async function buildDashboard(user) {
   const ids = await accessibleUserIds(user);
   const taskQuery = await taskQueryForUser(user);
   const userQuery = ['admin', 'auditor'].includes(user.role) ? {} : { _id: { $in: ids } };
-  const users = await User.find(userQuery).select('_id name role department status workStatus');
-  const taskMatch = { ...taskQuery };
-  const tasks = await Task.find(taskMatch).populate('assignedTo', 'name role department workStatus');
-  const tickets = await Ticket.find(['admin', 'auditor'].includes(user.role) ? {} : { $or: [{ assignedTo: { $in: ids } }, { createdBy: user._id }, { department: user.department }] });
-  const departments = await Department.countDocuments({ isActive: true });
+  const ticketQuery = ['admin', 'auditor'].includes(user.role) ? {} : { $or: [{ assignedTo: { $in: ids } }, { createdBy: user._id }, { department: user.department }] };
+  const [users, tasks, tickets, departments] = await Promise.all([
+    User.find(userQuery).select('_id name role department status workStatus').lean(),
+    Task.find(taskQuery)
+      .select('_id title project status priority dueDate completedAt assignedTo department')
+      .populate('assignedTo', 'name role department workStatus')
+      .lean(),
+    Ticket.find(ticketQuery).select('_id status').lean(),
+    Department.countDocuments({ isActive: true })
+  ]);
   const todayStart = new Date(); todayStart.setHours(0,0,0,0);
   const todayEnd = new Date(); todayEnd.setHours(23,59,59,999);
   const weekStart = new Date(Date.now() - 6 * 24 * 60 * 60 * 1000); weekStart.setHours(0,0,0,0);
