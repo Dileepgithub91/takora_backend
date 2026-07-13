@@ -1,4 +1,5 @@
 import express from 'express';
+import xlsx from 'xlsx';
 import Ticket from '../models/Ticket.js';
 import User from '../models/User.js';
 import { protect, readOnlyBlock } from '../middleware/auth.js';
@@ -77,9 +78,30 @@ async function buildTicketQuery(req) {
     if (!allowed || allowed.includes(String(req.query.assignedTo))) filters.assignedTo = req.query.assignedTo;
   }
 
+  const employeeSearch = clean(req.query.employeeSearch);
+  if (!filters.assignedTo && employeeSearch && !/^all employees$/i.test(employeeSearch) && ['admin', 'manager'].includes(req.user.role)) {
+    const allowed = req.user.role === 'admin' ? null : ids;
+    const userQuery = {
+      status: 'active',
+      $or: [
+        { name: { $regex: employeeSearch, $options: 'i' } },
+        { email: { $regex: employeeSearch, $options: 'i' } },
+        { employeeId: { $regex: employeeSearch, $options: 'i' } },
+        { department: { $regex: employeeSearch, $options: 'i' } }
+      ]
+    };
+    if (allowed) userQuery._id = { $in: allowed };
+    const matchedUsers = await User.find(userQuery).select('_id').limit(100).lean();
+    filters.assignedTo = { $in: matchedUsers.map(u => u._id) };
+  }
+
   if (req.query.from || req.query.to) filters.slaDueDate = {};
   if (req.query.from) filters.slaDueDate.$gte = new Date(req.query.from);
   if (req.query.to) filters.slaDueDate.$lte = new Date(req.query.to);
+
+  if (req.query.createdFrom || req.query.createdTo) filters.createdAt = {};
+  if (req.query.createdFrom) filters.createdAt.$gte = new Date(`${req.query.createdFrom}T00:00:00.000+05:30`);
+  if (req.query.createdTo) filters.createdAt.$lte = new Date(`${req.query.createdTo}T23:59:59.999+05:30`);
 
   const search = clean(req.query.search);
   const searchQuery = search ? {
@@ -120,7 +142,8 @@ async function nextTicketNo() {
 
 function populateTicket(query) {
   return query
-    .populate('assignedTo createdBy comments.user attachments.uploadedBy extensionRequests.requestedBy extensionRequests.reviewedBy activityLog.actor', 'name email role department avatar');
+    .populate('assignedTo createdBy comments.user attachments.uploadedBy extensionRequests.requestedBy extensionRequests.reviewedBy activityLog.actor', 'name email role department avatar')
+    .lean();
 }
 
 async function populatedTicket(id) {
@@ -150,7 +173,7 @@ router.get('/', asyncHandler(async (req, res) => {
   const q = await buildTicketQuery(req);
   const tickets = await populateTicket(Ticket.find(q))
     .sort({ createdAt: -1, updatedAt: -1 })
-    .limit(300);
+    .limit(Math.min(Number(req.query.limit || 200), 500));
 
   res.json({ tickets });
 }));
@@ -223,6 +246,114 @@ router.get('/calendar', asyncHandler(async (req, res) => {
     }))
   });
 }));
+
+async function ticketImportTemplate(req, res) {
+  const rows = [
+    {
+      title: 'Customer refund follow up',
+      description: 'Check refund status and update customer',
+      source: 'customer',
+      category: 'customerComplaint',
+      priority: 'medium',
+      status: 'open',
+      assignedEmail: 'support@takoramart.com',
+      requesterName: 'Customer Name',
+      requesterEmail: 'customer@example.com',
+      requesterPhone: '9876543210',
+      department: 'Customer Support',
+      createdAt: '2026-07-11 10:00'
+    },
+    {
+      title: 'Vendor image issue',
+      description: 'Vendor product image not opening',
+      source: 'vendor',
+      category: 'vendorIssue',
+      priority: 'high',
+      status: 'inProgress',
+      assignedEmail: 'marketing@takoramart.com',
+      requesterName: 'Vendor Name',
+      requesterEmail: 'vendor@example.com',
+      requesterPhone: '9876543211',
+      department: 'Marketing',
+      createdAt: '2026-07-11 11:30'
+    }
+  ];
+  const wb = xlsx.utils.book_new();
+  const ws = xlsx.utils.json_to_sheet(rows);
+  xlsx.utils.book_append_sheet(wb, ws, 'Tickets');
+  const buffer = xlsx.write(wb, { type: 'buffer', bookType: 'xlsx' });
+  res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+  res.setHeader('Content-Disposition', 'attachment; filename=takora-ticket-import-template.xlsx');
+  res.send(buffer);
+}
+
+router.get('/import-template', asyncHandler(ticketImportTemplate));
+router.get('/template', asyncHandler(ticketImportTemplate));
+router.get('/download-template', asyncHandler(ticketImportTemplate));
+
+async function bulkImportTickets(req, res) {
+  let items = req.body.tickets || [];
+  if (typeof items === 'string') items = JSON.parse(items);
+
+  if (req.file) {
+    const wb = xlsx.read(req.file.buffer, { type: 'buffer' });
+    const sheet = wb.Sheets[wb.SheetNames[0]];
+    items = xlsx.utils.sheet_to_json(sheet);
+  }
+
+  const created = [];
+  const skipped = [];
+
+  for (const row of items) {
+    try {
+      const title = clean(row.title);
+      if (!title) throw new Error('Ticket title is required');
+
+      const assigned =
+        await User.findOne({ email: String(row.assignedEmail || row.assignedToEmail || row.email || '').trim().toLowerCase() }) ||
+        await User.findById(row.assignedTo).catch(() => null);
+
+      if (!assigned) throw new Error('Assigned employee email/id not found');
+
+      const priority = normalizePriority(row.priority, 'low');
+      const status = pick(String(row.status || 'open').trim(), statuses, 'open');
+      const createdAt = row.createdAt ? new Date(row.createdAt) : new Date();
+      const slaHours = priorityToSlaHours(priority);
+
+      const ticket = await Ticket.create({
+        ticketNo: await nextTicketNo(),
+        source: pick(String(row.source || 'internal').trim(), sources, 'internal'),
+        requesterName: clean(row.requesterName),
+        requesterEmail: clean(row.requesterEmail).toLowerCase(),
+        requesterPhone: clean(row.requesterPhone),
+        title,
+        description: clean(row.description),
+        category: pick(String(row.category || 'other').trim(), categories, 'other'),
+        priority,
+        slaHours,
+        status,
+        approvalStatus: status === 'closed' ? 'adminApproved' : 'notSubmitted',
+        department: clean(row.department, assigned.department || req.user.department || 'Customer Support'),
+        assignedTo: assigned._id,
+        createdBy: req.user._id,
+        slaDueDate: calculateDueDate({ startDate: createdAt, priority, slaHours }),
+        createdAt,
+        updatedAt: createdAt,
+        activityLog: [{ actor: req.user._id, action: 'Imported From Excel', detail: `Ticket imported with ${visibleSlaLabel(priority)} SLA` }]
+      });
+
+      created.push(ticket);
+    } catch (error) {
+      skipped.push({ row, reason: error.message });
+    }
+  }
+
+  res.status(201).json({ count: created.length, skippedCount: skipped.length, skipped, tickets: created });
+}
+
+router.post('/bulk', readOnlyBlock, upload.single('file'), asyncHandler(bulkImportTickets));
+router.post('/import', readOnlyBlock, upload.single('file'), asyncHandler(bulkImportTickets));
+
 
 
 async function changeTicketStatus(req, res) {

@@ -63,4 +63,8 @@ const ticketSchema = new mongoose.Schema({
   activityLog: [{ actor: { type: mongoose.Schema.Types.ObjectId, ref: 'User' }, action: String, detail: String, createdAt: { type: Date, default: Date.now } }]
 }, { timestamps: true });
 
+ticketSchema.index({ title: 'text', description: 'text', ticketNo: 'text', requesterName: 'text', requesterEmail: 'text' });
+ticketSchema.index({ assignedTo: 1, status: 1, priority: 1, source: 1, createdAt: -1, slaDueDate: 1 });
+ticketSchema.index({ department: 1, createdAt: -1 });
+
 export default mongoose.model('Ticket', ticketSchema);

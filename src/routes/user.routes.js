@@ -89,11 +89,13 @@ async function publicAssignableUser(u) {
 
 router.get('/assignable', async (req, res, next) => {
   try {
+    // Fast lightweight endpoint for dropdowns. Do not generate signed S3 avatar URLs here.
     const users = await User.find({ status: 'active' })
-      .select('_id name email role department branch designation employeeId phone whatsapp avatar avatarKey workStatus status')
-      .sort({ name: 1, role: 1, department: 1 });
+      .select('_id name email role department branch designation employeeId phone whatsapp workStatus status')
+      .sort({ name: 1, role: 1, department: 1 })
+      .lean();
 
-    res.json({ users: await Promise.all(users.map(publicAssignableUser)) });
+    res.json({ users });
   } catch (error) {
     next(error);
   }

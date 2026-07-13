@@ -26,7 +26,8 @@ async function populateTask(query) {
     .populate('dependencies', 'title status dueDate')
     .populate('comments.user', 'name email role avatar')
     .populate('extensionRequests.requestedBy extensionRequests.reviewedBy', 'name email role department avatar')
-    .populate('activityLog.actor', 'name email role avatar');
+    .populate('activityLog.actor', 'name email role avatar')
+    .lean();
 }
 
 function cleanText(value, fallback = '') {
@@ -73,7 +74,8 @@ async function applyTemplate(body) {
 }
 
 async function buildTaskQuery(req) {
-  await refreshOverdueTasks(await taskQueryForUser(req.user));
+  // Keep dashboard fast. Overdue refresh is optional and can be handled by automation.
+  if (req.query.refreshOverdue === 'true') await refreshOverdueTasks(await taskQueryForUser(req.user));
   const base = await taskQueryForUser(req.user);
   const q = { ...base };
 
@@ -87,9 +89,30 @@ async function buildTaskQuery(req) {
     if (!allowed || allowed.includes(String(req.query.assignedTo))) q.assignedTo = req.query.assignedTo;
   }
 
+  const employeeSearch = String(req.query.employeeSearch || '').trim();
+  if (!q.assignedTo && employeeSearch && !/^all employees$/i.test(employeeSearch) && ['admin', 'manager'].includes(req.user.role)) {
+    const allowed = req.user.role === 'admin' ? null : await accessibleUserIds(req.user);
+    const userQuery = {
+      status: 'active',
+      $or: [
+        { name: { $regex: employeeSearch, $options: 'i' } },
+        { email: { $regex: employeeSearch, $options: 'i' } },
+        { employeeId: { $regex: employeeSearch, $options: 'i' } },
+        { department: { $regex: employeeSearch, $options: 'i' } }
+      ]
+    };
+    if (allowed) userQuery._id = { $in: allowed };
+    const matchedUsers = await User.find(userQuery).select('_id').limit(100).lean();
+    q.assignedTo = { $in: matchedUsers.map(u => u._id) };
+  }
+
   if (req.query.from || req.query.to) q.dueDate = {};
   if (req.query.from) q.dueDate.$gte = new Date(req.query.from);
   if (req.query.to) q.dueDate.$lte = new Date(req.query.to);
+
+  if (req.query.createdFrom || req.query.createdTo) q.createdAt = {};
+  if (req.query.createdFrom) q.createdAt.$gte = new Date(`${req.query.createdFrom}T00:00:00.000+05:30`);
+  if (req.query.createdTo) q.createdAt.$lte = new Date(`${req.query.createdTo}T23:59:59.999+05:30`);
   if (req.query.search) q.$text = { $search: req.query.search };
   return q;
 }
@@ -112,7 +135,7 @@ async function setTaskAssigneeAndDefaults(req, body) {
 
 router.get('/', async (req, res) => {
   const q = await buildTaskQuery(req);
-  const tasks = await populateTask(Task.find(q).sort({ createdAt: -1, updatedAt: -1 }));
+  const tasks = await populateTask(Task.find(q).sort({ createdAt: -1, updatedAt: -1 }).limit(Math.min(Number(req.query.limit || 200), 500)));
   res.json({ tasks });
 });
 
@@ -140,8 +163,8 @@ router.get('/calendar', async (req, res) => {
 
 router.get('/import-template', async (req, res) => {
   const rows = [
-    { title: 'Vendor Follow Up', description: 'Call vendor and update onboarding status', assignedEmail: 'marketing@takoramart.com', priority: 'medium', category: 'Vendor Onboarding', department: 'Marketing' },
-    { title: 'Product Image Check', description: 'Check image quality and report issues', assignedEmail: 'support@takoramart.com', priority: 'high', category: 'Product Upload', department: 'Customer Support' }
+    { title: 'Vendor Follow Up', description: 'Call vendor and update onboarding status', assignedEmail: 'marketing@takoramart.com', priority: 'medium', status: 'todo', category: 'Vendor Onboarding', department: 'Marketing', startDate: '2026-07-11 10:00' },
+    { title: 'Product Image Check', description: 'Check image quality and report issues', assignedEmail: 'support@takoramart.com', priority: 'high', status: 'inProgress', category: 'Product Upload', department: 'Customer Support', startDate: '2026-07-11 11:00' }
   ];
   const wb = xlsx.utils.book_new();
   const ws = xlsx.utils.json_to_sheet(rows);
@@ -154,8 +177,8 @@ router.get('/import-template', async (req, res) => {
 
 router.get('/import/template', async (req, res) => {
   const rows = [
-    { title: 'Vendor Follow Up', description: 'Call vendor and update onboarding status', assignedEmail: 'marketing@takoramart.com', priority: 'medium', category: 'Vendor Onboarding', department: 'Marketing' },
-    { title: 'Product Image Check', description: 'Check image quality and report issues', assignedEmail: 'support@takoramart.com', priority: 'high', category: 'Product Upload', department: 'Customer Support' }
+    { title: 'Vendor Follow Up', description: 'Call vendor and update onboarding status', assignedEmail: 'marketing@takoramart.com', priority: 'medium', status: 'todo', category: 'Vendor Onboarding', department: 'Marketing', startDate: '2026-07-11 10:00' },
+    { title: 'Product Image Check', description: 'Check image quality and report issues', assignedEmail: 'support@takoramart.com', priority: 'high', status: 'inProgress', category: 'Product Upload', department: 'Customer Support', startDate: '2026-07-11 11:00' }
   ];
   const wb = xlsx.utils.book_new();
   const ws = xlsx.utils.json_to_sheet(rows);
@@ -237,6 +260,7 @@ async function bulkImportTasks(req, res) {
         department: cleanText(row.department, assigned.department || req.user.department),
         branch: cleanText(row.branch, assigned.branch || req.user.branch),
         priority,
+        status: taskStatuses.includes(String(row.status || '').trim()) ? String(row.status).trim() : 'todo',
         assignedTo: assigned._id,
         assignedBy: req.user._id,
         startDate,

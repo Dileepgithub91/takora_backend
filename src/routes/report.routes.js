@@ -7,7 +7,6 @@ import User from '../models/User.js';
 import Department from '../models/Department.js';
 import { protect } from '../middleware/auth.js';
 import { accessibleUserIds, taskQueryForUser } from '../utils/accessControl.js';
-import { refreshOverdueTasks } from '../utils/sla.js';
 
 const router = express.Router();
 router.use(protect);
@@ -40,7 +39,7 @@ function commonDates() {
 
 async function buildTaskDashboard(user) {
   const { taskQuery, ticketQuery, userQuery } = await buildBaseQueries(user);
-  await refreshOverdueTasks(taskQuery);
+  // Keep dashboard fast. Overdue status refresh runs through automation / explicit task list refresh.
 
   const [users, tasks, tickets, departments] = await Promise.all([
     User.find(userQuery).select('_id name role department status workStatus').lean(),

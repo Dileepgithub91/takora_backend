@@ -93,5 +93,7 @@ const taskSchema = new mongoose.Schema({
 }, { timestamps: true });
 
 taskSchema.index({ title: 'text', description: 'text', category: 'text' });
+taskSchema.index({ assignedTo: 1, status: 1, priority: 1, createdAt: -1, dueDate: 1 });
+taskSchema.index({ department: 1, createdAt: -1 });
 
 export default mongoose.model('Task', taskSchema);
